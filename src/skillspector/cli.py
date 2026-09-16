@@ -56,7 +56,7 @@ from skillspector.models import Finding
 from skillspector.multi_skill import MultiSkillDetectionResult, SkillDirectory, detect_skills
 from skillspector.nodes.report import report
 from skillspector.sarif_models import SARIF_SCHEMA_URI, validate_sarif_report
-from skillspector.state import MAX_WORKFLOW_BYTES
+from skillspector.state import MAX_WORKFLOW_BYTES, MAX_WORKFLOW_SECONDS
 from skillspector.suppression import (
     Baseline,
     build_baseline_dict,
@@ -100,7 +100,7 @@ err_console = Console(stderr=True)
 
 _TRANSITIVE_MAX_TARGETS = 32
 _TRANSITIVE_MAX_BYTES = 10 * 1024 * 1024
-_TRANSITIVE_MAX_SECONDS = 60.0
+_TRANSITIVE_MAX_SECONDS = MAX_WORKFLOW_SECONDS
 _TRANSITIVE_MAX_ARTIFACTS = 10_000
 _TRANSITIVE_MAX_FINDINGS = 10_000
 _TRANSITIVE_MAX_COMPONENTS = 10_000
@@ -494,6 +494,13 @@ def scan(
             help="Exit 1 when relevant analysis is partial or incomplete.",
         ),
     ] = False,
+    fail_on_findings: Annotated[
+        bool,
+        typer.Option(
+            "--fail-on-findings",
+            help="Exit 1 when the scan reports one or more active findings.",
+        ),
+    ] = False,
     verbose: Annotated[
         bool,
         typer.Option(
@@ -571,6 +578,8 @@ def scan(
                 console.print(f"Report saved to: {output}")
             else:
                 print(report)
+            if fail_on_findings and result["findings"]:
+                raise typer.Exit(code=1)
             if result["risk_score"] > RISK_THRESHOLD:
                 raise typer.Exit(code=1)
         except typer.Exit:
@@ -628,10 +637,11 @@ def scan(
                 yara_dir=yara_dir,
                 verbose=verbose,
                 fail_on_incomplete=fail_on_incomplete,
+                fail_on_findings=fail_on_findings,
             )
             return
         if detection.complete and not detection.has_root_skill and len(detection.skills) == 0:
-            console.print(
+            (err_console if format == FormatChoice.json else console).print(
                 "[yellow]Warning:[/yellow] --recursive specified but no sub-skills "
                 "detected. Scanning as single skill."
             )
@@ -644,7 +654,7 @@ def scan(
                 "with a bounded scan and reporting partial coverage."
             )
         if detection.is_multi_skill:
-            console.print(
+            (err_console if format == FormatChoice.json else console).print(
                 f"[yellow]Warning:[/yellow] Found {len(detection.skills)} skills in "
                 f"this directory. Use --recursive to scan each independently."
             )
@@ -701,6 +711,8 @@ def scan(
             else True
         )
         if fail_on_incomplete and not is_complete:
+            raise typer.Exit(code=1)
+        if fail_on_findings and effective_findings(result):
             raise typer.Exit(code=1)
         if (result.get("risk_score") or 0) > RISK_THRESHOLD:
             raise typer.Exit(code=1)
@@ -1864,7 +1876,9 @@ def _scan_skill(
     yara_dir = str(yara_rules_dir.resolve()) if yara_rules_dir else None
     active_visited: set[str] = set()
     if verbose:
-        console.print("[dim]Running scan...[/dim]")
+        (err_console if format == FormatChoice.json else console).print(
+            "[dim]Running scan...[/dim]"
+        )
     logger.debug(
         "Scan started: input_path=%s, format=%s, use_llm=%s, transitive=%s",
         input_path,
@@ -2075,13 +2089,17 @@ def _scan_multi_skill(
     yara_dir: str | None = None,
     verbose: bool = False,
     fail_on_incomplete: bool = False,
+    fail_on_findings: bool = False,
     **legacy_kwargs: object,
 ) -> None:
     """Scan each detected sub-skill independently and produce a combined report."""
     if yara_dir is None and isinstance(legacy_kwargs.get("yara_rules_dir"), Path):
         yara_dir = str(legacy_kwargs["yara_rules_dir"])
     skills = detection.skills
-    console.print(f"[bold]Multi-skill directory detected:[/bold] {len(skills)} skills found\n")
+    status_console = err_console if format == FormatChoice.json and output is None else console
+    status_console.print(
+        f"[bold]Multi-skill directory detected:[/bold] {len(skills)} skills found\n"
+    )
 
     shared_transitive_cache: dict[str, _CachedTransitiveResult] = {}
     shared_transitive_traversal = _TransitiveTraversalState(
@@ -2097,6 +2115,7 @@ def _scan_multi_skill(
     transitive_finding_count = 0
     transitive_sources: set[str] = set()
     analysis_incomplete = not detection.complete
+    has_findings = False
     aggregate_limitations = [
         f"recursive discovery {limitation.resource} limit reached"
         for limitation in detection.limitations[:256]
@@ -2130,7 +2149,7 @@ def _scan_multi_skill(
             analysis_incomplete = True
             aggregate_limitations.extend(shared_transitive_traversal.truncation_reasons)
             break
-        console.print(
+        status_console.print(
             f"  [{i}/{len(skills)}] Scanning [bold]{skill.name}[/bold] ({skill.relative_path}/)"
         )
         try:
@@ -2152,6 +2171,7 @@ def _scan_multi_skill(
             result_body = _result_body(result)
             result_characters = len(result_body)
             result_records = _multi_skill_public_record_count(result)
+            has_findings = has_findings or bool(effective_findings(result))
             if (
                 retained_public_records + result_records > _MULTI_SKILL_MAX_PUBLIC_RECORDS
                 or retained_report_characters + result_characters
@@ -2204,7 +2224,7 @@ def _scan_multi_skill(
             for source in _coerce_str_path_list(result.get("transitive_sources")):
                 transitive_sources.add(source)
             severity = result.get("risk_severity") or "LOW"
-            console.print(f"         Score: {score}/100 ({severity})\n")
+            status_console.print(f"         Score: {score}/100 ({severity})\n")
         except Exception as e:
             error_message = str(e)[:1_024]
             err_console.print(f"         [red]Error:[/red] {error_message}\n")
@@ -2230,33 +2250,35 @@ def _scan_multi_skill(
     )
     analysis_incomplete = not bool(aggregate_completeness["is_complete"])
 
-    console.print("\n[bold]═══ Multi-Skill Summary ═══[/bold]\n")
-    console.print(
+    status_console.print("\n[bold]═══ Multi-Skill Summary ═══[/bold]\n")
+    status_console.print(
         f"  {'Skill':<30} {'Score':<8} {'Severity':<12} {'Findings':<10} {'Execution':<10}"
     )
-    console.print(f"  {'─' * 30} {'─' * 8} {'─' * 12} {'─' * 10} {'─' * 10}")
+    status_console.print(f"  {'─' * 30} {'─' * 8} {'─' * 12} {'─' * 10} {'─' * 10}")
 
     for skill, result in zip(processed_skills, results, strict=True):
         if "error" in result:
-            console.print(f"  {skill.name:<30} {'ERROR':<8} {'—':<12} {'—':<10} {'error':<10}")
+            status_console.print(
+                f"  {skill.name:<30} {'ERROR':<8} {'—':<12} {'—':<10} {'error':<10}"
+            )
             continue
         score = result.get("risk_score", 0)
         severity = result.get("risk_severity", "LOW")
         finding_count = len(effective_findings(result))
         execution = "failed" if result.get("execution_successful") is False else "successful"
-        console.print(
+        status_console.print(
             f"  {skill.name:<30} {score:<8} {severity:<12} {finding_count:<10} {execution:<10}"
         )
     if omitted_skill_count:
-        console.print(
+        status_console.print(
             f"  {'<omitted>':<30} {'—':<8} {'—':<12} {omitted_skill_count:<10} {'partial':<10}"
         )
-        console.print(
+        status_console.print(
             "[yellow]Recursive scan incomplete:[/yellow] one or more skills were omitted "
             "after an aggregate safety limit."
         )
 
-    if output and format == FormatChoice.json:
+    if format == FormatChoice.json:
         combined: dict[str, object] = {
             "multi_skill": True,
             "skill_count": len(skills),
@@ -2346,8 +2368,11 @@ def _scan_multi_skill(
             }
             rendered = json.dumps(combined, indent=2)
         _ensure_recursive_output_bound(rendered)
-        Path(output).write_text(rendered, encoding="utf-8")
-        console.print(f"[green]Combined report saved to:[/green] {output}")
+        if output:
+            Path(output).write_text(rendered, encoding="utf-8")
+            console.print(f"[green]Combined report saved to:[/green] {output}")
+        else:
+            print(rendered)
     elif output and format == FormatChoice.sarif:
         merged_sarif = _multi_skill_sarif_report(
             processed_skills,
@@ -2395,6 +2420,8 @@ def _scan_multi_skill(
     if execution_failed:
         raise typer.Exit(code=2)
     if fail_on_incomplete and analysis_incomplete:
+        raise typer.Exit(code=1)
+    if fail_on_findings and has_findings:
         raise typer.Exit(code=1)
     if max_score > RISK_THRESHOLD:
         raise typer.Exit(code=1)

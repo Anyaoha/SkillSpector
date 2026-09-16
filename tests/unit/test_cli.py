@@ -220,6 +220,33 @@ def test_cli_fail_on_incomplete_exits_one_after_writing_report(
     assert output.exists()
 
 
+def test_cli_fail_on_findings_exits_one_below_risk_threshold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Active findings can gate automation even when aggregate risk remains low."""
+    (tmp_path / "SKILL.md").write_text("# Safe", encoding="utf-8")
+    output = tmp_path / "report.json"
+    monkeypatch.setattr(
+        "skillspector.cli.graph.invoke",
+        lambda state, config: {
+            "report_body": '{"issues": []}',
+            "execution_successful": True,
+            "analysis_completeness": {"is_complete": True},
+            "risk_score": 0,
+            "findings": [_finding("T1", "active finding")],
+            "filtered_findings": [_finding("T1", "active finding")],
+        },
+    )
+
+    result = runner.invoke(
+        app,
+        ["scan", str(tmp_path), "-f", "json", "-o", str(output), "--fail-on-findings"],
+    )
+
+    assert result.exit_code == 1
+    assert output.exists()
+
+
 def test_recursive_scan_exits_two_after_writing_all_child_reports(tmp_path: Path) -> None:
     """Recursive mode aggregates child execution failures after producing output."""
     s1 = SkillDirectory(path=tmp_path / "one", name="one", relative_path="one")
@@ -491,6 +518,65 @@ def test_cli_mcp_registry_exits_1_when_aggregate_risk_crosses_threshold(tmp_path
     result = runner.invoke(app, ["scan", str(payload), "--mcp-registry", "--format", "json"])
     assert result.exit_code == 1
     assert json.loads(result.output)["risk_score"] == 95
+
+
+def test_cli_mcp_registry_fail_on_findings_exits_1_below_risk_threshold(
+    tmp_path: Path,
+) -> None:
+    payload = tmp_path / "registry.json"
+    payload.write_text(
+        json.dumps(
+            {
+                "servers": [
+                    {
+                        "server": {
+                            "name": "mutable/example",
+                            "repository": {
+                                "url": "https://github.com/example/project",
+                                "source": "github",
+                            },
+                            "packages": [
+                                {
+                                    "registryType": "npm",
+                                    "identifier": "example",
+                                    "version": "latest",
+                                    "fileSha256": "a" * 64,
+                                    "transport": {"type": "stdio"},
+                                }
+                            ],
+                            "remotes": [
+                                {
+                                    "type": "streamable-http",
+                                    "url": "https://example.invalid/mcp",
+                                }
+                            ],
+                        },
+                        "_meta": {
+                            "io.modelcontextprotocol.registry/official": {"status": "active"}
+                        },
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(payload),
+            "--mcp-registry",
+            "--format",
+            "json",
+            "--fail-on-findings",
+        ],
+    )
+
+    assert result.exit_code == 1
+    report = json.loads(result.output)
+    assert report["risk_score"] == 30
+    assert [finding["id"] for finding in report["findings"]] == ["MCP-PACKAGE-VERSION"]
 
 
 @pytest.mark.parametrize(
@@ -841,6 +927,158 @@ def test_scan_multi_skill_json_output_unchanged(tmp_path: Path) -> None:
     assert "skills" in data
 
 
+def test_scan_multi_skill_json_stdout_is_machine_readable(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """Recursive JSON without --output emits only the combined document to stdout."""
+    s1 = SkillDirectory(path=tmp_path / "skill1", name="skill1", relative_path="skill1")
+    s2 = SkillDirectory(path=tmp_path / "skill2", name="skill2", relative_path="skill2")
+    detection = MultiSkillDetectionResult(
+        is_multi_skill=True, skills=[s1, s2], has_root_skill=False
+    )
+    results = [
+        {
+            "report_body": json.dumps({"issues": []}),
+            "risk_score": 10,
+            "risk_severity": "LOW",
+            "findings": [],
+        },
+        {
+            "report_body": json.dumps({"issues": []}),
+            "risk_score": 20,
+            "risk_severity": "LOW",
+            "findings": [],
+        },
+    ]
+
+    with patch("skillspector.cli.graph.invoke", side_effect=results):
+        _scan_multi_skill(
+            detection,
+            FormatChoice.json,
+            None,
+            no_llm=True,
+            baseline=None,
+            show_suppressed=False,
+            transitive_enabled=False,
+            transitive_depth=1,
+            transitive_allow_prefix=(),
+            transitive_deny_prefix=(),
+            yara_dir=None,
+            verbose=True,
+        )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["multi_skill"] is True
+    assert payload["skill_count"] == 2
+    assert payload["max_risk_score"] == 20
+    assert "Scanning" not in captured.out
+    assert "Multi-Skill Summary" not in captured.out
+    assert "Scanning" in captured.err
+    assert "Running scan" in captured.err
+    assert "Multi-Skill Summary" in captured.err
+
+
+def test_scan_multi_skill_json_stdout_survives_child_failure(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+) -> None:
+    """A failed child still emits one parseable combined document before exit 2."""
+    skills = [
+        SkillDirectory(path=tmp_path / name, name=name, relative_path=name)
+        for name in ("healthy", "broken")
+    ]
+    detection = MultiSkillDetectionResult(is_multi_skill=True, skills=skills)
+    healthy = {
+        "report_body": json.dumps({"issues": []}),
+        "risk_score": 0,
+        "risk_severity": "LOW",
+        "findings": [],
+    }
+
+    with (
+        patch("skillspector.cli.graph.invoke", side_effect=[healthy, RuntimeError("boom")]),
+        pytest.raises(typer.Exit) as exit_info,
+    ):
+        _scan_multi_skill(detection, FormatChoice.json, None, no_llm=True)
+
+    assert exit_info.value.exit_code == 2
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["execution_successful"] is False
+    assert payload["skills"][1] == {"name": "broken", "error": "boom"}
+    assert "Error: boom" in captured.err
+
+
+def test_recursive_json_single_skill_advisory_does_not_pollute_stdout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Recursive fallback advisories stay off stdout when JSON is requested."""
+    monkeypatch.setattr(
+        cli,
+        "detect_skills",
+        lambda _path: MultiSkillDetectionResult(
+            is_multi_skill=False,
+            skills=[],
+            has_root_skill=False,
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_scan_skill",
+        lambda **_kwargs: {
+            "report_body": json.dumps({"issues": []}),
+            "risk_score": 0,
+        },
+    )
+
+    result = runner.invoke(
+        app,
+        ["scan", str(tmp_path), "--recursive", "--format", "json", "--no-llm"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {"issues": []}
+    assert "Scanning as single" not in result.stdout
+    assert "Scanning as single" in result.stderr
+
+
+def test_json_multi_skill_advisory_does_not_pollute_stdout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The non-recursive multi-skill advisory stays off JSON stdout."""
+    skills = [
+        SkillDirectory(path=tmp_path / name, name=name, relative_path=name)
+        for name in ("one", "two")
+    ]
+    monkeypatch.setattr(
+        cli,
+        "detect_skills",
+        lambda _path: MultiSkillDetectionResult(
+            is_multi_skill=True,
+            skills=skills,
+            has_root_skill=False,
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_scan_skill",
+        lambda **_kwargs: {
+            "report_body": json.dumps({"issues": []}),
+            "risk_score": 0,
+        },
+    )
+
+    result = runner.invoke(
+        app,
+        ["scan", str(tmp_path), "--format", "json", "--no-llm"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == {"issues": []}
+    assert "Use --recursive" not in result.stdout
+    assert "Use --recursive" in result.stderr
+
+
 def test_recursive_detection_limit_reaches_canonical_incomplete_report(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -912,6 +1150,28 @@ def _bounded_recursive_result(label: str, *, finding_count: int = 1) -> dict[str
         "filtered_findings": findings,
         "suppressed_findings": [],
     }
+
+
+def test_recursive_fail_on_findings_exits_one_below_risk_threshold(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Recursive scans gate on active child findings, not only aggregate score."""
+    skill = SkillDirectory(tmp_path / "one", "one", "one")
+    detection = MultiSkillDetectionResult(is_multi_skill=True, skills=[skill])
+    monkeypatch.setattr(
+        cli.graph, "invoke", lambda *_args, **_kwargs: _bounded_recursive_result("one")
+    )
+
+    with pytest.raises(typer.Exit) as exit_info:
+        _scan_multi_skill(
+            detection,
+            FormatChoice.json,
+            None,
+            no_llm=True,
+            fail_on_findings=True,
+        )
+
+    assert exit_info.value.exit_code == 1
 
 
 def test_recursive_json_uses_one_global_public_record_budget(
@@ -1760,14 +2020,16 @@ def test_recursive_transitive_roots_consume_child_time_budget(tmp_path: Path, mo
         show_suppressed: bool = False,
         transitive_traversal=None,
     ) -> dict[str, object]:
-        fake_time["value"] += 61.0
+        fake_time["value"] += cli._TRANSITIVE_MAX_SECONDS + 1.0
         return _mock_graph_result(file_cache={"SKILL.md": "https://github.com/org/dep.git"})
 
     def fake_scan_transitive(*args, traversal=None, **kwargs) -> dict[str, object]:
         assert traversal is not None
         assert traversal.remaining_seconds() == 0.0
         assert traversal.can_scan_more() is False
-        assert traversal.truncation_reasons == ["time budget 60s reached"]
+        assert traversal.truncation_reasons == [
+            f"time budget {cli._TRANSITIVE_MAX_SECONDS:g}s reached"
+        ]
         return {
             "report_body": "{}",
             "filtered_findings": [],
